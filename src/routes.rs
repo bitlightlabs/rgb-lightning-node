@@ -9,16 +9,18 @@ use bitcoin::Network;
 use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::ChannelId;
 use lightning::onion_message::{Destination, OnionMessagePath};
-use lightning::rgb_utils::{get_rgb_payment_info_path, parse_rgb_payment_info};
+use lightning::rgb_utils::{
+    get_rgb_channel_info_path, get_rgb_payment_info_path, parse_rgb_channel_info,
+    parse_rgb_payment_info,
+};
 use lightning::sign::EntropySource;
+use lightning::util::config::ChannelConfig;
 use lightning::{
     ln::{
         channelmanager::{PaymentId, RecipientOnionFields, Retry},
         PaymentHash, PaymentPreimage,
     },
-    rgb_utils::{
-        get_rgb_channel_info, write_rgb_channel_info, write_rgb_payment_info_file, RgbInfo,
-    },
+    rgb_utils::{write_rgb_channel_info, write_rgb_payment_info_file, RgbInfo},
     routing::{
         gossip::NodeId,
         router::{PaymentParameters, RouteParameters},
@@ -244,7 +246,7 @@ pub(crate) struct DisconnectPeerRequest {
 #[derive(Deserialize, Serialize)]
 pub(crate) struct EmptyResponse {}
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub(crate) enum HTLCStatus {
     Pending,
     Succeeded,
@@ -390,6 +392,8 @@ pub(crate) struct OpenChannelRequest {
     pub(crate) asset_id: String,
     pub(crate) public: bool,
     pub(crate) with_anchors: bool,
+    pub(crate) fee_base_msat: Option<u32>,
+    pub(crate) fee_proportional_millionths: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -679,11 +683,12 @@ pub(crate) async fn asset_balance(
     let mut offchain_outbound = 0;
     let mut offchain_inbound = 0;
     for chan_info in unlocked_state.channel_manager.list_channels() {
-        let info_file_path = ldk_data_dir_path.join(chan_info.channel_id.to_hex());
+        let info_file_path =
+            get_rgb_channel_info_path(&chan_info.channel_id.to_hex(), &ldk_data_dir_path, false);
         if !info_file_path.exists() {
             continue;
         }
-        let (rgb_info, _) = get_rgb_channel_info(&chan_info.channel_id, &ldk_data_dir_path);
+        let rgb_info = parse_rgb_channel_info(&info_file_path);
         if rgb_info.contract_id == contract_id {
             offchain_outbound += rgb_info.local_rgb_amount;
             offchain_inbound += rgb_info.remote_rgb_amount;
@@ -1157,9 +1162,10 @@ pub(crate) async fn list_channels(
         }
 
         let ldk_data_dir_path = PathBuf::from(state.static_state.ldk_data_dir.clone());
-        let info_file_path = ldk_data_dir_path.join(chan_info.channel_id.to_hex());
+        let info_file_path =
+            get_rgb_channel_info_path(&chan_info.channel_id.to_hex(), &ldk_data_dir_path, false);
         if info_file_path.exists() {
-            let (rgb_info, _) = get_rgb_channel_info(&chan_info.channel_id, &ldk_data_dir_path);
+            let rgb_info = parse_rgb_channel_info(&info_file_path);
             channel.asset_id = Some(rgb_info.contract_id.to_string());
             channel.asset_local_amount = Some(rgb_info.local_rgb_amount);
             channel.asset_remote_amount = Some(rgb_info.remote_rgb_amount);
@@ -1515,6 +1521,13 @@ pub(crate) async fn open_channel(
             return Err(APIError::InsufficientAssets(spendable_rgb_amount));
         }
 
+        let mut channel_config = ChannelConfig::default();
+        if let Some(fee_base_msat) = payload.fee_base_msat {
+            channel_config.forwarding_fee_base_msat = fee_base_msat;
+        }
+        if let Some(fee_proportional_millionths) = payload.fee_proportional_millionths {
+            channel_config.forwarding_fee_proportional_millionths = fee_proportional_millionths;
+        }
         let config = UserConfig {
             channel_handshake_limits: ChannelHandshakeLimits {
                 // lnd's max to_self_delay is 2016, so we want to be compatible.
@@ -1528,6 +1541,7 @@ pub(crate) async fn open_channel(
                 negotiate_anchors_zero_fee_htlc_tx: payload.with_anchors,
                 ..Default::default()
             },
+            channel_config,
             ..Default::default()
         };
 
@@ -1553,18 +1567,21 @@ pub(crate) async fn open_channel(
         let _ =
             disk::persist_channel_peer(Path::new(&peer_data_path), &payload.peer_pubkey_and_addr);
 
-        let temporary_channel_id = temporary_channel_id.to_hex();
-        let channel_rgb_info_path = format!(
-            "{}/{}",
-            state.static_state.ldk_data_dir.clone(),
-            temporary_channel_id,
-        );
         let rgb_info = RgbInfo {
             contract_id,
             local_rgb_amount: payload.asset_amount,
             remote_rgb_amount: 0,
         };
-        write_rgb_channel_info(&PathBuf::from(&channel_rgb_info_path), &rgb_info);
+        let temporary_channel_id = temporary_channel_id.to_hex();
+        let ldk_data_dir_path = PathBuf::from(&state.static_state.ldk_data_dir);
+        write_rgb_channel_info(
+            &get_rgb_channel_info_path(&temporary_channel_id, &ldk_data_dir_path, true),
+            &rgb_info,
+        );
+        write_rgb_channel_info(
+            &get_rgb_channel_info_path(&temporary_channel_id, &ldk_data_dir_path, false),
+            &rgb_info,
+        );
 
         Ok(Json(OpenChannelResponse {
             temporary_channel_id,
